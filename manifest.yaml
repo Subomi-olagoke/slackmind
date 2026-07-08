@@ -1,0 +1,40 @@
+display_information:
+  name: SlackMind
+  description: A Slack agent with real long-term memory and real-time workspace grounding
+  background_color: "#1a1035"
+
+features:
+  bot_user:
+    display_name: SlackMind
+    always_online: true
+  slash_commands:
+    - command: /memory-audit
+      description: Show a Block Kit summary of what SlackMind remembers about you
+      usage_hint: "[optional memory id to filter]"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read      # see @-mentions
+      - chat:write             # post replies
+      - commands               # register/receive the /memory-audit slash command
+      - im:history              # read DM history (message.im events)
+      - im:read                # see DM channel metadata
+      - im:write               # open/send DMs
+      - search:read.public     # Real-Time Search — public channels (minimum required)
+      - search:read.private    # Real-Time Search — private channels
+      - search:read.im         # Real-Time Search — DMs
+      - search:read.users      # Real-Time Search — bot-token minimum also needs this
+      - search:read.files      # Real-Time Search — bot-token minimum also needs this
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention           # @-mentions in channels
+      - message.im            # DMs (Bolt handler filters channel_type == "im")
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true    # no request_url needed — events arrive over the websocket
+  org_deploy_enabled: false
+  token_rotation_enabled: false
