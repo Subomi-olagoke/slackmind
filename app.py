@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from blocks import build_audit_blocks
+from blocks import build_audit_blocks, build_forget_blocks
 from cortex_client import CortexClient
 from llm import GeneratedReply, canned_reply, generate_reply
 from rts import is_rts_enabled, search_realtime, should_search_realtime
@@ -57,16 +57,27 @@ def _namespace_for(user_id: str) -> str:
     return f"slack:{user_id}"
 
 
+def _team_namespace_for(channel_id: str) -> str:
+    """A second, shared namespace per channel — reuses Cortex's existing
+    (already tested) multi-tenant namespace isolation to give a channel its
+    own pool of memory that any member can recall from, not just the person
+    who stated it. Only meaningful in channels, not DMs (no "team" in a 1:1)."""
+    return f"slack:team:{channel_id}"
+
+
 def process_message(client, say, *, user_id: str, text: str, thread_ts: str | None,
-                     action_token: str | None, channel_types: list[str] | None) -> None:
+                     action_token: str | None, channel_types: list[str] | None,
+                     channel_id: str | None, is_dm: bool) -> None:
     """The shared pipeline for both @mentions and DMs:
 
-      1. Cortex /recall  — pull relevant prior context for this person
+      1. Cortex /recall  — pull relevant prior context: this person's own
+         memory, plus (in a channel, not a DM) the channel's shared memory
       2. Real-Time Search — only if the question smells like it needs
          fresh/current workspace info that memory can't supply
       3. Generate a reply — Claude if configured, else Cortex /chat if
          *it* has a model key, else an honest canned reply
-      4. Cortex /remember — store anything durable that came out of this turn
+      4. Cortex /remember — store anything durable that came out of this
+         turn, personal vs. team as the reply generator tagged it
     """
     text = text.strip()
     if not text:
@@ -74,32 +85,68 @@ def process_message(client, say, *, user_id: str, text: str, thread_ts: str | No
         return
 
     namespace = _namespace_for(user_id)
+    team_namespace = None if is_dm or not channel_id else _team_namespace_for(channel_id)
 
     memories = cortex.recall(namespace, text, k=5)
-    log.info("recall() -> %d memories for %s", len(memories), namespace)
+    for m in memories:
+        m["_scope"] = "personal"
+    if team_namespace:
+        team_memories = cortex.recall(team_namespace, text, k=5)
+        for m in team_memories:
+            m["_scope"] = "team"
+        memories = memories + team_memories
+    log.info("recall() -> %d memories (namespace=%s, team_namespace=%s)", len(memories), namespace, team_namespace)
 
     search_results: list[dict] = []
     if is_rts_enabled(client) and should_search_realtime(text, had_memory_hits=bool(memories)):
         search_results = search_realtime(client, text, action_token, channel_types=channel_types)
         log.info("Real-Time Search -> %d hits", len(search_results))
 
-    reply = _generate(namespace, user_id, text, memories, search_results)
+    reply = _generate(namespace, team_namespace, user_id, text, memories, search_results)
+
+    if reply.forget_query:
+        # Conversational forget-intent, detected by the same LLM that just
+        # replied — search now (the LLM only flagged intent, it doesn't have
+        # recall results for the *forget* query itself) and hand back the
+        # same confirm-button UI /memory-forget uses, so a "yes, delete" is
+        # still a deliberate click, not something the model did on its own.
+        forget_matches = cortex.recall(namespace, reply.forget_query, k=5)
+        for m in forget_matches:
+            m["_namespace"] = namespace
+            m["_scope"] = "personal"
+        if team_namespace:
+            team_forget_matches = cortex.recall(team_namespace, reply.forget_query, k=5)
+            for m in team_forget_matches:
+                m["_namespace"] = team_namespace
+                m["_scope"] = "team"
+            forget_matches = forget_matches + team_forget_matches
+        log.info("Conversational forget-request '%s' -> %d candidate matches", reply.forget_query, len(forget_matches))
+        blocks = build_forget_blocks(reply.forget_query, forget_matches, _FORGET_VALUE_SEP)
+        say(text=reply.text, blocks=blocks, thread_ts=thread_ts)
+        return
 
     say(text=reply.text, thread_ts=thread_ts)
 
 
-def _generate(namespace: str, user_id: str, text: str, memories: list[dict],
-              search_results: list[dict]) -> GeneratedReply:
-    if os.environ.get("ANTHROPIC_API_KEY"):
+def _store_extracted_memories(reply: GeneratedReply, namespace: str, team_namespace: str | None, user_id: str) -> None:
+    for m in reply.memories_to_store:
+        scope = m.get("scope", "personal")
+        target_ns = team_namespace if (scope == "team" and team_namespace) else namespace
+        cortex.remember(
+            target_ns,
+            m["content"],
+            kind=m.get("kind", "fact"),
+            salience=float(m.get("salience", 0.5)),
+            source=f"slack-dm:{user_id}",
+        )
+
+
+def _generate(namespace: str, team_namespace: str | None, user_id: str, text: str,
+              memories: list[dict], search_results: list[dict]) -> GeneratedReply:
+    has_compat = os.environ.get("OPENAI_COMPAT_BASE_URL") and os.environ.get("OPENAI_COMPAT_API_KEY")
+    if has_compat or os.environ.get("ANTHROPIC_API_KEY"):
         reply = generate_reply(text, memories, search_results)
-        for m in reply.memories_to_store:
-            cortex.remember(
-                namespace,
-                m["content"],
-                kind=m.get("kind", "fact"),
-                salience=float(m.get("salience", 0.5)),
-                source=f"slack-dm:{user_id}",
-            )
+        _store_extracted_memories(reply, namespace, team_namespace, user_id)
         return reply
 
     # No Claude key on the Slack side — try Cortex's own /chat, which does
@@ -142,6 +189,8 @@ def handle_app_mention(event, say, client):
         thread_ts=event.get("thread_ts") or event.get("ts"),
         action_token=event.get("action_token"),
         channel_types=["public_channel", "private_channel"],
+        channel_id=event.get("channel"),
+        is_dm=False,
     )
 
 
@@ -161,6 +210,8 @@ def handle_dm(event, say, client):
         thread_ts=None,
         action_token=event.get("action_token"),
         channel_types=["im", "public_channel", "private_channel"],
+        channel_id=event.get("channel"),
+        is_dm=True,
     )
 
 
@@ -187,6 +238,66 @@ def handle_memory_audit(ack, respond, command):
 
 
 # ---------------------------------------------------------------------------
+# /memory-forget slash command — the correction/deletion half of the audit
+# story. /memory-audit shows what's remembered; this is how you actually do
+# something about it, closing the "you can see it but not touch it" gap.
+# ---------------------------------------------------------------------------
+
+# Slack button values are plain strings — encode both fields SlackMind needs
+# to call Cortex's DELETE (namespace + memory_id) into one, since a button
+# has no separate metadata field of its own to carry them in.
+_FORGET_VALUE_SEP = "\x1f"  # unit separator — won't collide with real content
+
+
+@app.command("/memory-forget")
+def handle_memory_forget(ack, respond, command):
+    ack()
+    user_id = command["user_id"]
+    namespace = _namespace_for(user_id)
+    query = command.get("text", "").strip()
+
+    if not query:
+        respond(
+            response_type="ephemeral",
+            text="Usage: `/memory-forget <keyword>` — e.g. `/memory-forget terse code reviews`. "
+            "I'll show you matching memories with a button to forget each one.",
+        )
+        return
+
+    matches = cortex.recall(namespace, query, k=8)
+    for m in matches:
+        m["_namespace"] = namespace
+        m["_scope"] = "personal"
+    blocks = build_forget_blocks(query, matches, _FORGET_VALUE_SEP)
+    respond(
+        response_type="ephemeral",  # only the requester sees this — deletion is personal
+        text=f"Found {len(matches)} memories matching '{query}'",
+        blocks=blocks,
+    )
+
+
+@app.action("forget_memory")
+def handle_forget_button(ack, body, respond):
+    ack()
+    value = body["actions"][0]["value"]
+    namespace, memory_id, content = value.split(_FORGET_VALUE_SEP, 2)
+
+    result = cortex.delete_memory(namespace, memory_id)
+    if result is not None:
+        respond(
+            response_type="ephemeral",
+            replace_original=False,
+            text=f"✅ Forgotten: _{content}_",
+        )
+    else:
+        respond(
+            response_type="ephemeral",
+            replace_original=False,
+            text=f"⚠️ Couldn't forget that one — it may already be gone. (`{memory_id}`)",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -200,7 +311,15 @@ if __name__ == "__main__":
             "until it's running (start it with: uvicorn main:app --port 8000)",
             CORTEX_API_URL,
         )
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        log.info("ANTHROPIC_API_KEY not set — will try Cortex /chat, then fall back to canned replies")
+    if os.environ.get("OPENAI_COMPAT_BASE_URL") and os.environ.get("OPENAI_COMPAT_API_KEY"):
+        log.info(
+            "Reply generation: OpenAI-compatible endpoint at %s (model=%s)",
+            os.environ["OPENAI_COMPAT_BASE_URL"],
+            os.environ.get("OPENAI_COMPAT_MODEL", "gpt-4o-mini"),
+        )
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        log.info("Reply generation: direct Claude call (ANTHROPIC_API_KEY set)")
+    else:
+        log.info("Reply generation: no LLM key configured — will try Cortex /chat, then fall back to canned replies")
 
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()

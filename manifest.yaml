@@ -12,6 +12,10 @@ features:
       description: Show a Block Kit summary of what SlackMind remembers about you
       usage_hint: "[optional memory id to filter]"
       should_escape: false
+    - command: /memory-forget
+      description: Find and forget a stored memory matching a keyword
+      usage_hint: "<keyword>"
+      should_escape: false
 
 oauth_config:
   scopes:

@@ -155,3 +155,16 @@ class CortexClient:
         if resp is None or resp.status_code != 200:
             return []
         return resp.json().get("audit", [])
+
+    # -- DELETE /memories/{memory_id} --------------------------------------
+    def delete_memory(self, namespace: str, memory_id: str) -> Optional[dict]:
+        """Soft-delete: Cortex marks the memory superseded (reason: "deleted
+        via API") rather than erasing it — it still shows up in the audit
+        trail, just no longer active. Returns None on 404 (already gone) or
+        any transport failure."""
+        resp = self._request("DELETE", f"/memories/{memory_id}", params={"namespace": namespace})
+        if resp is None or resp.status_code != 200:
+            if resp is not None and resp.status_code != 404:
+                log.warning("delete_memory() failed: %s %s", resp.status_code, resp.text[:300])
+            return None
+        return resp.json()

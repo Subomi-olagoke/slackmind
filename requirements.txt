@@ -2,4 +2,5 @@ slack_bolt>=1.20
 slack_sdk>=3.27
 requests>=2.31
 anthropic>=0.40
+openai>=1.30
 python-dotenv>=1.0

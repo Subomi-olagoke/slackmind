@@ -132,3 +132,68 @@ def build_audit_blocks(
         }
     )
     return blocks
+
+
+def build_forget_blocks(
+    query: str,
+    matches: list[dict],
+    value_sep: str,
+) -> list[dict]:
+    """Forget-flow results (from either the /memory-forget command or a
+    conversational "forget that I said X"): each match gets its own section
+    + a "Forget" button. Each match dict must carry its own `_namespace`
+    (personal and team-scoped matches can be mixed in one list, and each
+    needs its correct source namespace for the delete call to work) plus the
+    usual `id`/`content`/`kind` from Cortex. The button's value packs
+    namespace/memory_id/content together (Slack buttons carry a single
+    string, no separate metadata slot) so the click handler can call
+    Cortex's DELETE and still show a human-readable confirmation without a
+    second round-trip."""
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "🗑️ Forget a memory", "emoji": True},
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Matches for *{query}*"}],
+        },
+        {"type": "divider"},
+    ]
+
+    if not matches:
+        blocks.append(
+            {"type": "section", "text": {"type": "mrkdwn", "text": "_Nothing matched that — nothing to forget._"}}
+        )
+        return blocks
+
+    for m in matches:
+        emoji = _KIND_EMOJI.get(m.get("kind", "fact"), "🧩")
+        scope_tag = "team" if m.get("_scope") == "team" else "personal"
+        content = m.get("content", "")
+        memory_id = m.get("id", "")
+        match_namespace = m.get("_namespace", "")
+        # Truncate the content carried in the button value defensively — Slack
+        # caps block/action text length, and a very long memory shouldn't be
+        # able to break the round trip.
+        packed_content = content[:150]
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"{emoji} {content}\n_[{scope_tag}]_"},
+                "accessory": {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Forget", "emoji": True},
+                    "style": "danger",
+                    "action_id": "forget_memory",
+                    "value": f"{match_namespace}{value_sep}{memory_id}{value_sep}{packed_content}",
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Forget this memory?"},
+                        "text": {"type": "mrkdwn", "text": f"_{content}_"},
+                        "confirm": {"type": "plain_text", "text": "Forget it"},
+                        "deny": {"type": "plain_text", "text": "Cancel"},
+                    },
+                },
+            }
+        )
+    return blocks

@@ -20,9 +20,9 @@ Slack's own Bolt SDK with two things:
    lifecycle events written to a queryable audit trail. Cortex runs as its
    own FastAPI process; SlackMind talks to it purely over its REST API
    (`POST /remember`, `POST /recall`, `POST /chat`, `GET /memories`,
-   `GET /audit`) — never by trying to spawn Cortex's MCP stdio server as a
-   subprocess, which isn't practical across a Slack-bot/memory-server
-   process boundary.
+   `GET /audit`, `DELETE /memories/{id}`) — never by trying to spawn Cortex's
+   MCP stdio server as a subprocess, which isn't practical across a
+   Slack-bot/memory-server process boundary.
 2. **Slack's Real-Time Search API** (`assistant.search.context`) — for the
    other half of "the bot doesn't know things": questions that need *fresh,
    in-workspace* context (what did the team just decide in #proj-gizmo?)
@@ -31,8 +31,31 @@ Slack's own Bolt SDK with two things:
    workspace right now."
 
 The result: mention SlackMind or DM it, and it answers using both what it
-remembers about *you* (across every channel and DM, forever, until it
-naturally decays) and what's actually happening in the workspace *today*.
+remembers (personal, and — in a channel — shared team memory, across every
+channel and DM, forever, until it naturally decays) and what's actually
+happening in the workspace *today*.
+
+**Beyond plain recall, it does three things most memory bots don't:**
+
+- **Reconciles memory against fresh reality**, not just against new
+  statements. If a Real-Time Search hit contradicts a stored memory (memory
+  says the deadline is Friday, a message just found says it moved to
+  Monday), the bot says so explicitly and feeds the correction back through
+  the same contradiction-detection path a person's own correction would use
+  — it doesn't silently pick one and ignore the conflict.
+- **Distinguishes personal from team memory.** Say something in a channel
+  that sounds like a team decision, and it's stored in a namespace any
+  member of that channel can recall from — not locked to whoever said it.
+  Personal preferences stay personal. This reuses Cortex's own
+  (already-tested) multi-tenant namespace isolation; no new memory
+  infrastructure needed, just two namespaces instead of one.
+- **Lets you correct it, conversationally.** Say "forget that I said I
+  prefer terse reviews" in plain language, and it finds the matching
+  memory and shows a **confirm button** before anything is actually
+  deleted — the model can suggest what might match, but a human click is
+  what actually triggers the delete, every time. `/memory-forget <keyword>`
+  is the same flow as a slash command, for when you'd rather not phrase it
+  as a sentence.
 
 ## How a message flows
 
@@ -40,26 +63,29 @@ naturally decays) and what's actually happening in the workspace *today*.
 Slack message (@mention or DM)
         │
         ▼
-Cortex POST /recall  ──────────► relevant memories for this person
+Cortex POST /recall (personal namespace)
+  + POST /recall (team namespace, channels only) ──► merged, scope-tagged memories
         │
         ▼
 looks like it needs fresh info? ──► Slack assistant.search.context
         │                                (Real-Time Search)
         ▼
-generate a reply:
-  1. ANTHROPIC_API_KEY set?      → Claude (claude-opus-4-8), given memory +
-                                    search context, also emits a structured
-                                    memory-extraction block
-  2. else: Cortex POST /chat     → Cortex's own recall+generate+store,
-     (if Cortex has a model key)   using ITS model key instead
-  3. else: canned reply          → still surfaces memory/search hits, and
-                                    stores a coarse heuristic memory so the
-                                    system keeps demonstrably working with
-                                    zero LLM keys configured anywhere
+generate a reply (first available wins, none required):
+  1. OPENAI_COMPAT_BASE_URL/API_KEY set → any OpenAI-compatible endpoint,
+     given memory + search context, also emits a structured memory-
+     extraction block (tagged personal/team) and, rarely, a forget-request
+  2. else ANTHROPIC_API_KEY set        → direct Claude call, same contract
+  3. else Cortex POST /chat            → Cortex's own recall+generate+store,
+     (if Cortex has a model key)         using ITS model key instead
+  4. else: canned reply                → still surfaces memory/search hits,
+                                           stores a coarse heuristic memory,
+                                           system stays demonstrably running
+                                           with zero LLM keys configured
+                                           anywhere
         │
         ▼
-Cortex POST /remember  ─────────► whatever came out of this turn worth
-                                    keeping long-term
+Cortex POST /remember (personal or team namespace, per extracted scope)
+   — or, if a forget-request was detected, a confirm-button UI instead
 ```
 
 `/memory-audit` is the separate, always-on introspection surface: it calls
@@ -72,12 +98,12 @@ events.
 
 | File | Purpose |
 |---|---|
-| `app.py` | Bolt app (Socket Mode): `app_mention` + DM handlers, `/memory-audit` command, the message pipeline |
-| `cortex_client.py` | REST client for Cortex's exact endpoints/shapes (`/remember`, `/recall`, `/chat`, `/memories`, `/audit`, `/health`) |
+| `app.py` | Bolt app (Socket Mode): `app_mention` + DM handlers, `/memory-audit` + `/memory-forget` commands, the `forget_memory` button handler, the message pipeline (personal + team recall, reply generation, storage) |
+| `cortex_client.py` | REST client for Cortex's exact endpoints/shapes (`/remember`, `/recall`, `/chat`, `/memories`, `/audit`, `/health`, `DELETE /memories/{id}`) |
 | `rts.py` | Slack Real-Time Search integration (`assistant.search.context` / `.info`) + the heuristic for when to trigger it |
-| `llm.py` | Claude reply generation (`claude-opus-4-8`) + memory-extraction parsing + the canned no-LLM fallback |
-| `blocks.py` | Block Kit rendering for `/memory-audit` |
-| `manifest.yaml` | Slack app manifest with every OAuth scope the code above actually uses |
+| `llm.py` | Reply generation (provider-agnostic: any OpenAI-compatible endpoint, or direct Claude) + memory-extraction parsing + forget-request detection + the canned no-LLM fallback |
+| `blocks.py` | Block Kit rendering for `/memory-audit` and the forget-confirmation UI (shared by `/memory-forget` and the conversational flow) |
+| `manifest.yaml` | Slack app manifest with every OAuth scope + slash command the code above actually uses |
 | `requirements.txt` / `.env.example` / `.gitignore` | Standard project plumbing |
 
 ## Setup
@@ -94,7 +120,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ### 2. Create the Slack app
 
 1. Go to <https://api.slack.com/apps> → **Create New App** → **From an app manifest**.
-2. Paste in `manifest.yaml` from this repo.
+2. Paste in `manifest.yaml` from this repo (JSON tab if your workspace's
+   manifest editor mangles multi-line YAML — both are equivalent).
 3. Under **Socket Mode**, enable it and generate an **app-level token** with
    the `connections:write` scope — this is your `SLACK_APP_TOKEN` (`xapp-...`).
 4. **Install the app** to your workspace to get the bot token
@@ -111,7 +138,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 cp .env.example .env
 # fill in SLACK_BOT_TOKEN, SLACK_APP_TOKEN
 # CORTEX_API_URL defaults to http://localhost:8000
-# ANTHROPIC_API_KEY is optional — see fallback chain above
+# reply generation is optional and provider-agnostic — see fallback chain below
 ```
 
 ### 4. Install and run
@@ -129,9 +156,15 @@ an outbound websocket the app opens itself.
 
 - `@SlackMind what's my favorite editor?` (after telling it once — it should
   remember across channels and DMs)
-- DM it directly — DMs work the same as mentions, no `@` needed
-- `/memory-audit` — see everything it currently remembers about you, with
-  the full audit trail
+- In a channel: say something that sounds like a team decision ("we decided
+  to ship Friday"), then have someone *else* ask about it — shared memory,
+  not locked to whoever said it
+- DM it directly — DMs work the same as mentions, no `@` needed, but there's
+  no "team" namespace in a 1:1
+- "forget that I said X" in a normal message, or `/memory-forget <keyword>`
+  — either way, nothing is deleted until you click Confirm
+- `/memory-audit` — see everything it currently remembers, with the full
+  audit trail
 
 ## Judging rubric mapping
 
@@ -142,43 +175,60 @@ response shapes are read directly from Cortex's `main.py`), plus Slack's own
 Real-Time Search API (`assistant.search.context`) for live grounding,
 wired with the correct granular `search:read.*` scopes, the `action_token`
 sourced from real event payloads, and a capability check
-(`assistant.search.info`) before ever relying on it. Both Bolt (Python,
-Socket Mode) and the Slack CLI-manifest workflow are used as intended.
+(`assistant.search.info`) before ever relying on it. Reply generation is
+provider-agnostic by design (any OpenAI-compatible endpoint, or direct
+Claude) rather than hard-wired to one vendor. Both Bolt (Python, Socket
+Mode) and the Slack CLI-manifest workflow are used as intended.
 
-**Design** — `/memory-audit` is the concrete UX surface for this criterion:
-a Block Kit layout (header, salience meters, an audit-activity breakdown,
-a dedicated "contradictions resolved" section) instead of a raw JSON or
-plain-text dump of what the bot knows.
+**Design** — `/memory-audit` (Block Kit: salience meters, audit-activity
+breakdown, a dedicated "contradictions resolved" section) and the
+forget-confirmation UI (matching memories, a danger-styled button per one,
+a native Slack confirm dialog before anything is deleted) are the concrete
+UX surfaces for this criterion — structured, inspectable, and safety-gated,
+not a raw JSON dump or a destructive action with no undo-guard.
 
 **Potential Impact** — "I have to re-explain my context every conversation"
 is a universal pain in any busy Slack workspace, not a novelty demo. Memory
-that follows a person across channels/DMs and decays what's no longer
-relevant is directly useful in any team, immediately, with no bespoke setup
-per use case.
+that follows a person across channels/DMs, distinguishes personal from
+team-shared knowledge, and decays what's no longer relevant is directly
+useful in any team, immediately, with no bespoke setup per use case.
 
 **Quality of Idea** — most "AI + memory" bots are a thin wrapper around a
 vector DB: embed everything, cosine-similarity it back, done, no notion of
-what should be forgotten or what happens when two stored facts disagree.
-Cortex's approach is more rigorous: dedupe-on-write, reinforcement-on-recall,
-explicit contradiction resolution via `supersede`, salience-scaled decay,
-and a compliance-grade audit trail for every one of those lifecycle events —
-exactly the kind of governance a real, long-running workspace agent needs
-and a plain vector store doesn't give you for free.
+what should be forgotten, what happens when two stored facts disagree, or
+whether a stored fact is even still true. Cortex's approach is more
+rigorous — dedupe-on-write, reinforcement-on-recall, explicit contradiction
+resolution via `supersede`, salience-scaled decay, a compliance-grade audit
+trail — and SlackMind extends that rigor into places most memory bots never
+go: reconciling memory against *live* evidence (not just new statements),
+scoping memory to the right audience (personal vs. team), and requiring a
+deliberate human confirmation before anything is forgotten, even when the
+request to forget was itself conversational.
 
 ## Notes on the fallback chain
 
 Every piece of this app is designed to run and be demoable with zero
 external LLM keys:
 
-- No `ANTHROPIC_API_KEY` and Cortex has no `DASHSCOPE_API_KEY` either → the
-  canned-reply path still calls `/recall`, surfaces what it finds, and
-  exercises `/remember` with a coarse heuristic ("this looks like a
-  statement worth keeping"), so the whole memory loop is still visibly
-  running.
-- No `ANTHROPIC_API_KEY` but Cortex *does* have a model key → SlackMind
-  transparently defers reply generation to Cortex's own `POST /chat`, which
-  does recall + generate + store in a single call.
-- `ANTHROPIC_API_KEY` set → the full pipeline: Claude sees retrieved memory
-  and any Real-Time Search hits, answers, and emits a structured
-  memory-extraction block that SlackMind parses and writes back via
-  `POST /remember`.
+- No reply-generation key anywhere, and Cortex has no `DASHSCOPE_API_KEY`
+  either → the canned-reply path still calls `/recall` (personal + team),
+  surfaces what it finds, and exercises `/remember` with a coarse heuristic
+  ("this looks like a statement worth keeping"), so the whole memory loop is
+  still visibly running.
+- No reply-generation key on the Slack side, but Cortex *does* have a model
+  key → SlackMind transparently defers reply generation to Cortex's own
+  `POST /chat`, which does recall + generate + store in a single call.
+- `OPENAI_COMPAT_BASE_URL`/`OPENAI_COMPAT_API_KEY` or `ANTHROPIC_API_KEY` set
+  → the full pipeline: the model sees retrieved memory (tagged
+  personal/team) and any Real-Time Search hits, answers, and emits a
+  structured memory-extraction block (with scope) and, when it detects
+  explicit forget-intent, a separate forget-request block — SlackMind parses
+  both and acts accordingly (store, or show a confirm UI).
+
+**Honest caveat on contradiction resolution specifically:** the "supersede"
+path lives in Cortex, and it only runs its full LLM-based classification
+when Cortex itself has a real `DASHSCOPE_API_KEY` configured. Without one,
+`remember()` falls back to plain cosine-similarity merging — real,
+functional, but not the full contradiction-detection story. This is called
+out here rather than glossed over; the demo video reflects whichever mode
+was actually configured at recording time.
