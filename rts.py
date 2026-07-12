@@ -39,6 +39,16 @@ _RECENCY_PAT = re.compile(
 
 _rts_enabled_cache: dict[str, bool] = {}
 
+# Stopwords for the history-fallback keyword match — kept local to avoid a
+# dependency, deliberately small (just the highest-frequency noise words).
+_STOP = {
+    "the", "a", "an", "is", "are", "was", "were", "to", "of", "it", "its",
+    "and", "or", "not", "what", "when", "where", "who", "why", "how", "do",
+    "does", "did", "for", "with", "on", "in", "at", "be", "this", "that",
+    "i", "you", "we", "they", "me", "my", "our", "your", "about", "can",
+    "will", "would", "should", "could", "have", "has", "had", "am", "get",
+}
+
 
 def should_search_realtime(text: str, had_memory_hits: bool) -> bool:
     """Decide whether a message warrants a live Slack search.
@@ -115,3 +125,132 @@ def search_realtime(
     except Exception as e:  # pragma: no cover - defensive
         log.warning("Real-Time Search unexpected error: %s", e)
         return []
+
+
+# ---------------------------------------------------------------------------
+# Plan-independent fallback: conversations.history over the channels the bot
+# can see. assistant.search.context is a Slack-AI feature gated to Business+/
+# Enterprise+ plans (assistant.search.info reports is_ai_search_enabled=False
+# elsewhere). This keeps the "live workspace grounding" half of SlackMind
+# working on ANY plan — Free/Pro included — using standard Web API methods
+# (channels:history / groups:history / im:history, all already granted), so
+# the feature degrades instead of vanishing. Lower-fidelity than semantic
+# search (keyword + recency, not embeddings), and honestly labelled as such.
+# ---------------------------------------------------------------------------
+
+def _keywords(text: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if t not in _STOP and len(t) > 2}
+
+
+def _member_channels(client, current_channel: Optional[str], max_channels: int) -> list[dict]:
+    """The current channel first, then other channels the bot is a member of.
+    Each item is {id, name}. Fails soft to just the current channel."""
+    seen: dict[str, dict] = {}
+    if current_channel:
+        name = "this-channel"
+        try:
+            info = client.conversations_info(channel=current_channel)
+            name = info.get("channel", {}).get("name") or name
+        except Exception:
+            pass
+        seen[current_channel] = {"id": current_channel, "name": name}
+    try:
+        resp = client.conversations_list(
+            types="public_channel,private_channel",
+            exclude_archived=True, limit=200,
+        )
+        for ch in resp.get("channels", []):
+            if not ch.get("is_member"):
+                continue
+            if ch["id"] not in seen:
+                seen[ch["id"]] = {"id": ch["id"], "name": ch.get("name", "channel")}
+            if len(seen) >= max_channels:
+                break
+    except SlackApiError as e:
+        log.info("conversations.list unavailable (%s) — scanning current channel only", e.response.get("error"))
+    except Exception as e:  # pragma: no cover - defensive
+        log.info("conversations.list failed (%s) — scanning current channel only", e)
+    return list(seen.values())
+
+
+def search_history_fallback(
+    client,
+    query: str,
+    current_channel: Optional[str],
+    limit: int = 5,
+    max_channels: int = 6,
+    per_channel: int = 60,
+) -> list[dict]:
+    """Approximate live workspace grounding without Slack AI: scan recent
+    messages across the bot's channels, rank by query-keyword overlap
+    (recency as tie-break), and return the top hits in the SAME shape RTS
+    produces (content / author_name / channel_name / permalink) so the reply
+    pipeline and canned fallback render them identically. Requires at least
+    one keyword hit to include a message — no keyword match means no grounding
+    injected, rather than dumping unrelated recent chatter into the reply.
+    """
+    kw = _keywords(query)
+    if not kw:
+        return []
+    channels = _member_channels(client, current_channel, max_channels)
+    scored: list[tuple[int, float, dict]] = []
+    for ch in channels:
+        try:
+            hist = client.conversations_history(channel=ch["id"], limit=per_channel)
+        except SlackApiError as e:
+            log.info("conversations.history(%s) failed (%s) — skipping", ch["id"], e.response.get("error"))
+            continue
+        except Exception:  # pragma: no cover - defensive
+            continue
+        for msg in hist.get("messages", []):
+            if msg.get("subtype") or msg.get("bot_id"):
+                continue  # skip joins/leaves/edits and other bots
+            text = msg.get("text", "")
+            hits = len(kw & _keywords(text))
+            if hits == 0:
+                continue
+            try:
+                ts = float(msg.get("ts", 0))
+            except (TypeError, ValueError):
+                ts = 0.0
+            scored.append((hits, ts, {
+                "content": text,
+                "user": msg.get("user", ""),
+                "ts": msg.get("ts", ""),
+                "channel_id": ch["id"],
+                "channel_name": ch["name"],
+            }))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    top = [item for _, _, item in scored[:limit]]
+    _hydrate(client, top)
+    return top
+
+
+_user_name_cache: dict[str, str] = {}
+
+
+def _hydrate(client, results: list[dict]) -> None:
+    """Best-effort author name + permalink for just the final results (≤limit
+    calls each), so the fallback reads like the real thing without paying a
+    lookup per scanned message."""
+    for r in results:
+        uid = r.get("user")
+        if uid:
+            if uid not in _user_name_cache:
+                try:
+                    info = client.users_info(user=uid)
+                    prof = info.get("user", {}).get("profile", {})
+                    _user_name_cache[uid] = (
+                        prof.get("display_name") or prof.get("real_name") or uid
+                    )
+                except Exception:
+                    _user_name_cache[uid] = uid
+            r["author_name"] = _user_name_cache[uid]
+        else:
+            r["author_name"] = "someone"
+        try:
+            link = client.chat_getPermalink(channel=r["channel_id"], message_ts=r["ts"])
+            r["permalink"] = link.get("permalink", "#")
+        except Exception:
+            r["permalink"] = "#"

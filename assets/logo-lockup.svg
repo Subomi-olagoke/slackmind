@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 140" width="480" height="140">
+  <rect x="0" y="0" width="480" height="140" fill="#ffffff"/>
+  <g font-family="'SF Mono','Menlo','Consolas','Courier New',monospace" text-anchor="middle" dominant-baseline="central">
+    <!-- icon, connectors (grey) -->
+    <g fill="#9a9a9a" font-size="20">
+      <text x="52" y="57">╱</text>
+      <text x="70" y="57">│</text>
+      <text x="88" y="57">╲</text>
+      <text x="52" y="70">─</text>
+      <text x="70" y="70">┼</text>
+      <text x="88" y="70">─</text>
+      <text x="52" y="83">╲</text>
+      <text x="70" y="83">│</text>
+      <text x="88" y="83">╱</text>
+    </g>
+    <!-- icon, nodes (black) -->
+    <g fill="#111111" font-size="22" font-weight="600">
+      <text x="70" y="45">●</text>
+      <text x="34" y="70">●</text>
+      <text x="106" y="70">●</text>
+      <text x="70" y="95">●</text>
+    </g>
+  </g>
+  <!-- wordmark -->
+  <text x="150" y="65" font-family="'SF Mono','Menlo','Consolas','Courier New',monospace"
+        font-size="34" font-weight="700" fill="#111111" letter-spacing="2">SLACKMIND</text>
+  <text x="150" y="90" font-family="'SF Mono','Menlo','Consolas','Courier New',monospace"
+        font-size="14" fill="#9a9a9a" letter-spacing="1">persistent memory for slack</text>
+</svg>

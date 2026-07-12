@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <rect x="0" y="0" width="200" height="200" fill="#ffffff"/>
+  <g font-family="'SF Mono','Menlo','Consolas','Courier New',monospace" text-anchor="middle" dominant-baseline="central">
+    <!-- connectors (grey) -->
+    <g fill="#9a9a9a" font-size="24">
+      <text x="72" y="82">╱</text>
+      <text x="100" y="82">│</text>
+      <text x="128" y="82">╲</text>
+      <text x="72" y="110">─</text>
+      <text x="100" y="110">┼</text>
+      <text x="128" y="110">─</text>
+      <text x="72" y="138">╲</text>
+      <text x="100" y="138">│</text>
+      <text x="128" y="138">╱</text>
+    </g>
+    <!-- nodes (black) -->
+    <g fill="#111111" font-size="26" font-weight="600">
+      <text x="100" y="54">●</text>
+      <text x="44" y="110">●</text>
+      <text x="156" y="110">●</text>
+      <text x="100" y="166">●</text>
+    </g>
+  </g>
+</svg>

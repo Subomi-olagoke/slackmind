@@ -30,6 +30,16 @@ Slack's own Bolt SDK with two things:
    do you know about me"; Real-Time Search answers "what's happening in this
    workspace right now."
 
+   Semantic Real-Time Search is a Slack AI feature gated to Business+/
+   Enterprise+ workspaces — `assistant.search.info` reports
+   `is_ai_search_enabled: false` elsewhere. So SlackMind **degrades instead
+   of losing the feature**: when semantic search isn't available (Free/Pro
+   workspaces, or AI search simply off), it falls back to a keyword+recency
+   scan of `conversations.history` across the channels the bot is in — plain
+   Web API methods available on every plan. Higher-fidelity semantic search
+   when the workspace has it; a real, working approximation when it doesn't.
+   The bot checks the capability at runtime and picks the right path itself.
+
 The result: mention SlackMind or DM it, and it answers using both what it
 remembers (personal, and — in a channel — shared team memory, across every
 channel and DM, forever, until it naturally decays) and what's actually
@@ -57,6 +67,43 @@ happening in the workspace *today*.
   is the same flow as a slash command, for when you'd rather not phrase it
   as a sentence.
 
+## Architecture
+
+```mermaid
+graph TB
+    subgraph SLACK["Slack Workspace"]
+        U["User — @mention / DM"]
+        RTS["Real-Time Search API<br/>assistant.search.context"]
+        HIST["conversations.history<br/>any-plan fallback"]
+        BK["Block Kit UI<br/>/memory-audit · /memory-forget"]
+    end
+    subgraph SM["SlackMind — Bolt app · Socket Mode"]
+        EH["Event handlers<br/>app_mention · message.im · slash commands"]
+        PIPE["Message pipeline<br/>recall → ground → generate → store"]
+    end
+    subgraph CX["Cortex — Memory Server · FastAPI"]
+        API["REST API<br/>/remember · /recall · /chat · /memories · /audit"]
+        ENG["Memory Engine<br/>dedupe · reinforce · supersede · decay + forget"]
+        STORE["Persisted store + audit trail<br/>atomic JSON, per-namespace"]
+    end
+    LLM["LLM provider<br/>Claude / OpenAI-compatible"]
+
+    U -->|Socket Mode ws| EH
+    EH --> PIPE
+    PIPE -->|1 recall personal+team| API
+    PIPE -->|2 live grounding| RTS
+    RTS -.->|Slack AI unavailable| HIST
+    PIPE -->|3 generate reply| LLM
+    PIPE -->|4 remember scoped| API
+    PIPE -->|reply to user| U
+    API --> ENG
+    ENG --> STORE
+    ENG -->|embeddings + contradiction check| LLM
+    BK -->|audit / forget| API
+```
+
+*A message flows through the pipeline in four numbered steps (recall → ground → generate → store); Cortex's Memory Engine governs every write, and Real-Time Search falls back to `conversations.history` on workspaces without Slack AI. Full step-by-step below.*
+
 ## How a message flows
 
 ```
@@ -68,7 +115,9 @@ Cortex POST /recall (personal namespace)
         │
         ▼
 looks like it needs fresh info? ──► Slack assistant.search.context
-        │                                (Real-Time Search)
+        │                                (Real-Time Search; or, if the
+        │                                 workspace lacks Slack AI, a
+        │                                 conversations.history keyword scan)
         ▼
 generate a reply (first available wins, none required):
   1. OPENAI_COMPAT_BASE_URL/API_KEY set → any OpenAI-compatible endpoint,

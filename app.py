@@ -30,7 +30,12 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from blocks import build_audit_blocks, build_forget_blocks
 from cortex_client import CortexClient
 from llm import GeneratedReply, canned_reply, generate_reply
-from rts import is_rts_enabled, search_realtime, should_search_realtime
+from rts import (
+    is_rts_enabled,
+    search_history_fallback,
+    search_realtime,
+    should_search_realtime,
+)
 
 load_dotenv()  # picks up a local .env if present; real env vars still win
 
@@ -98,9 +103,18 @@ def process_message(client, say, *, user_id: str, text: str, thread_ts: str | No
     log.info("recall() -> %d memories (namespace=%s, team_namespace=%s)", len(memories), namespace, team_namespace)
 
     search_results: list[dict] = []
-    if is_rts_enabled(client) and should_search_realtime(text, had_memory_hits=bool(memories)):
-        search_results = search_realtime(client, text, action_token, channel_types=channel_types)
-        log.info("Real-Time Search -> %d hits", len(search_results))
+    if should_search_realtime(text, had_memory_hits=bool(memories)):
+        # Prefer Slack's semantic Real-Time Search when the workspace has AI
+        # search (Business+/Enterprise+); otherwise fall back to a keyword+
+        # recency scan of conversations.history so live grounding still works
+        # on any plan. RTS returning nothing also drops through to the fallback.
+        if is_rts_enabled(client):
+            search_results = search_realtime(client, text, action_token, channel_types=channel_types)
+            log.info("Real-Time Search -> %d hits", len(search_results))
+        if not search_results:
+            search_results = search_history_fallback(client, text, channel_id)
+            if search_results:
+                log.info("History fallback -> %d hits", len(search_results))
 
     reply = _generate(namespace, team_namespace, user_id, text, memories, search_results)
 

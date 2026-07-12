@@ -1,0 +1,39 @@
+graph TB
+    subgraph SLACK["Slack Workspace"]
+        U["User — @mention / DM"]
+        RTS["Real-Time Search API<br/>assistant.search.context"]
+        HIST["conversations.history<br/>any-plan fallback"]
+        BK["Block Kit UI<br/>/memory-audit · /memory-forget"]
+    end
+    subgraph SM["SlackMind — Bolt app · Socket Mode"]
+        EH["Event handlers<br/>app_mention · message.im · slash commands"]
+        PIPE["Message pipeline<br/>recall → ground → generate → store"]
+    end
+    subgraph CX["Cortex — Memory Server · FastAPI"]
+        API["REST API<br/>/remember · /recall · /chat · /memories · /audit"]
+        ENG["Memory Engine<br/>dedupe · reinforce · supersede · decay + forget"]
+        STORE["Persisted store + audit trail<br/>atomic JSON, per-namespace"]
+    end
+    LLM["LLM provider<br/>Claude / OpenAI-compatible"]
+
+    U -->|Socket Mode ws| EH
+    EH --> PIPE
+    PIPE -->|1 recall personal+team| API
+    PIPE -->|2 live grounding| RTS
+    RTS -.->|Slack AI unavailable| HIST
+    PIPE -->|3 generate reply| LLM
+    PIPE -->|4 remember scoped| API
+    PIPE -->|reply to user| U
+    API --> ENG
+    ENG --> STORE
+    ENG -->|embeddings + contradiction check| LLM
+    BK -->|audit / forget| API
+
+    classDef slack fill:#4A154B,stroke:#3a1039,color:#fff;
+    classDef sm fill:#1a1035,stroke:#0d0820,color:#fff;
+    classDef cx fill:#0b6b5e,stroke:#084d44,color:#fff;
+    classDef llm fill:#8a5a00,stroke:#634000,color:#fff;
+    class U,RTS,HIST,BK slack;
+    class EH,PIPE sm;
+    class API,ENG,STORE cx;
+    class LLM llm;

@@ -1,0 +1,38 @@
+digraph SlackMind {
+  rankdir=TB; bgcolor="white"; fontname="Helvetica"; nodesep=0.5; ranksep=0.7; compound=true;
+  node [shape=box style="filled,rounded" fontname="Helvetica" fontcolor="white" fontsize=13 margin="0.3,0.2"];
+  edge [fontname="Helvetica" fontsize=11 color="#444444" fontcolor="#222222"];
+
+  subgraph cluster_slack {
+    label="Slack Workspace"; labeljust="l"; style="filled,rounded"; fillcolor="#f5f0d0"; color="#cabf70"; fontname="Helvetica-Bold"; fontsize=16;
+    U    [label="User\n@mention / DM" fillcolor="#4A154B"];
+    RTS  [label="Real-Time Search API\nassistant.search.context" fillcolor="#4A154B"];
+    HIST [label="conversations.history\n(any-plan fallback)" fillcolor="#4A154B"];
+    BK   [label="Block Kit UI\n/memory-audit  /memory-forget" fillcolor="#4A154B"];
+  }
+  subgraph cluster_sm {
+    label="SlackMind  -  Bolt app (Socket Mode)"; labeljust="l"; style="filled,rounded"; fillcolor="#e6e3f2"; color="#9a91c9"; fontname="Helvetica-Bold"; fontsize=16;
+    EH   [label="Event handlers\napp_mention / message.im / slash cmds" fillcolor="#1a1035"];
+    PIPE [label="Message pipeline\nrecall -> ground -> generate -> store" fillcolor="#1a1035"];
+  }
+  subgraph cluster_cx {
+    label="Cortex  -  Memory Server (FastAPI)"; labeljust="l"; style="filled,rounded"; fillcolor="#d5eee9"; color="#6fbfb0"; fontname="Helvetica-Bold"; fontsize=16;
+    API   [label="REST API\n/remember /recall /chat /memories /audit" fillcolor="#0b6b5e"];
+    ENG   [label="Memory Engine\ndedupe / reinforce / supersede / decay+forget" fillcolor="#0b6b5e"];
+    STORE [label="Persisted store + audit trail\natomic JSON, per-namespace" fillcolor="#0b6b5e"];
+  }
+  LLM [label="LLM provider\nClaude / OpenAI-compatible" fillcolor="#8a5a00"];
+
+  U   -> EH   [label="Socket Mode (ws)"];
+  EH  -> PIPE;
+  PIPE -> API [label="1. recall (personal+team)"];
+  PIPE -> RTS [label="2. live grounding"];
+  RTS -> HIST [label="Slack AI unavailable" style=dashed];
+  PIPE -> LLM [label="3. generate reply"];
+  PIPE -> API [label="4. remember (scoped)"];
+  PIPE -> U   [label="reply"];
+  API -> ENG;
+  ENG -> STORE;
+  ENG -> LLM  [label="embeddings + contradiction check"];
+  BK  -> API  [label="audit / forget"];
+}

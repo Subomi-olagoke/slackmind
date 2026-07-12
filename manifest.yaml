@@ -23,14 +23,23 @@ oauth_config:
       - app_mentions:read      # see @-mentions
       - chat:write             # post replies
       - commands               # register/receive the /memory-audit slash command
-      - im:history              # read DM history (message.im events)
+      - im:history             # read DM history (message.im events)
       - im:read                # see DM channel metadata
       - im:write               # open/send DMs
+      # Real-Time Search (assistant.search.context) — bot-token path. Only the
+      # scopes below apply to a bot token; search:read.private/.im are
+      # user-token-only per Slack's docs, so they're intentionally NOT here.
       - search:read.public     # Real-Time Search — public channels (minimum required)
-      - search:read.private    # Real-Time Search — private channels
-      - search:read.im         # Real-Time Search — DMs
       - search:read.users      # Real-Time Search — bot-token minimum also needs this
       - search:read.files      # Real-Time Search — bot-token minimum also needs this
+      # History fallback (any plan, when Slack AI search is unavailable):
+      # read recent messages across the channels the bot is in, and resolve
+      # channel/author names + permalinks for the surfaced hits.
+      - channels:history       # read recent messages in public channels the bot is in
+      - groups:history         # read recent messages in private channels the bot is in
+      - channels:read          # list public channels + membership/names
+      - groups:read            # list private channels + membership/names
+      - users:read             # resolve author display names for surfaced hits
 
 settings:
   event_subscriptions:
