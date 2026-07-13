@@ -70,6 +70,25 @@ def _team_namespace_for(channel_id: str) -> str:
     return f"slack:team:{channel_id}"
 
 
+def _forget_candidates(namespace: str, query: str, k: int = 8) -> list[dict]:
+    """Find memories to forget by BOTH semantic recall AND case-insensitive
+    substring match. Recall alone silently misses short/exact keywords — e.g.
+    `/memory-forget terse` never clears the embedding-similarity threshold
+    against "...terse code reviews...", so the substring pass catches what a
+    user literally typed. Semantic hits come first (best match), then any
+    substring-only hits, deduped by id."""
+    matches = cortex.recall(namespace, query, k=k)
+    seen = {m.get("id") for m in matches if m.get("id")}
+    ql = query.lower()
+    for m in cortex.list_memories(namespace):
+        if m.get("id") in seen:
+            continue
+        if ql in (m.get("content", "") or "").lower():
+            matches.append(m)
+            seen.add(m.get("id"))
+    return matches
+
+
 def process_message(client, say, *, user_id: str, text: str, thread_ts: str | None,
                      action_token: str | None, channel_types: list[str] | None,
                      channel_id: str | None, is_dm: bool) -> None:
@@ -124,12 +143,12 @@ def process_message(client, say, *, user_id: str, text: str, thread_ts: str | No
         # recall results for the *forget* query itself) and hand back the
         # same confirm-button UI /memory-forget uses, so a "yes, delete" is
         # still a deliberate click, not something the model did on its own.
-        forget_matches = cortex.recall(namespace, reply.forget_query, k=5)
+        forget_matches = _forget_candidates(namespace, reply.forget_query, k=5)
         for m in forget_matches:
             m["_namespace"] = namespace
             m["_scope"] = "personal"
         if team_namespace:
-            team_forget_matches = cortex.recall(team_namespace, reply.forget_query, k=5)
+            team_forget_matches = _forget_candidates(team_namespace, reply.forget_query, k=5)
             for m in team_forget_matches:
                 m["_namespace"] = team_namespace
                 m["_scope"] = "team"
@@ -260,7 +279,12 @@ def handle_memory_audit(ack, respond, command):
 # Slack button values are plain strings — encode both fields SlackMind needs
 # to call Cortex's DELETE (namespace + memory_id) into one, since a button
 # has no separate metadata field of its own to carry them in.
-_FORGET_VALUE_SEP = "\x1f"  # unit separator — won't collide with real content
+# Separator for packing namespace|memory_id|content into a button value.
+# Must be PRINTABLE: Slack strips non-printable control chars (e.g. \x1f) from
+# button values on the round-trip, which silently breaks the unpack. Neither the
+# namespace (slack:...) nor the hex memory_id contains "|"; content is unpacked
+# last with maxsplit=2, so a "|" inside content is harmless.
+_FORGET_VALUE_SEP = "|"
 
 
 @app.command("/memory-forget")
@@ -278,7 +302,7 @@ def handle_memory_forget(ack, respond, command):
         )
         return
 
-    matches = cortex.recall(namespace, query, k=8)
+    matches = _forget_candidates(namespace, query)
     for m in matches:
         m["_namespace"] = namespace
         m["_scope"] = "personal"
